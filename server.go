@@ -25,9 +25,9 @@ type conn struct {
 // clean up waiting map periodically
 func gcWaiting() {
 	for {
+		time.Sleep(time.Minute)
 		waiting.Lock()
 		for k, v := range waiting.names {
-			log.Println(v.RemoteAddr(), v.t)
 			if time.Since(v.t) > timeout {
 				log.Println(v.RemoteAddr(), "timeout")
 				v.Close()
