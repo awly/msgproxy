@@ -1,15 +1,42 @@
 package msgproxy
 
 import (
+	"io"
 	"log"
 	"net"
+	"strings"
 	"sync"
+	"time"
 )
 
+const timeout = time.Minute
+
 var waiting = struct {
-	names map[string]net.Conn
+	names map[string]conn
 	sync.Mutex
-}{names: make(map[string]net.Conn)}
+	sync.Once
+}{names: make(map[string]conn)}
+
+type conn struct {
+	net.Conn
+	t time.Time
+}
+
+// clean up waiting map periodically
+func gcWaiting() {
+	for {
+		waiting.Lock()
+		for k, v := range waiting.names {
+			log.Println(v.RemoteAddr(), v.t)
+			if time.Since(v.t) > timeout {
+				log.Println(v.RemoteAddr(), "timeout")
+				v.Close()
+				delete(waiting.names, k)
+			}
+		}
+		waiting.Unlock()
+	}
+}
 
 func ListenAndServe(laddr string) error {
 	l, err := net.Listen("tcp", laddr)
@@ -21,6 +48,10 @@ func ListenAndServe(laddr string) error {
 }
 
 func Serve(l net.Listener) error {
+	waiting.Do(func() {
+		go gcWaiting()
+	})
+
 	for {
 		c, err := l.Accept()
 		if err != nil {
@@ -34,7 +65,6 @@ func Serve(l net.Listener) error {
 }
 
 func serve(c net.Conn) {
-	defer c.Close()
 	buf := make([]byte, 1)
 	_, err := c.Read(buf)
 	if err != nil {
@@ -48,7 +78,7 @@ func serve(c net.Conn) {
 		return
 	}
 	name := string(buf)
-	log.Println(name, "connected")
+	log.Println(c.RemoteAddr(), "connected at", name)
 
 	waiting.Lock()
 	defer waiting.Unlock()
@@ -56,8 +86,24 @@ func serve(c net.Conn) {
 		delete(waiting.names, name)
 		join(c, other)
 	} else {
-		waiting.names[name] = c
+		waiting.names[name] = conn{Conn: c, t: time.Now()}
 	}
 }
 
-func join(a, b net.Conn) {}
+func join(a, b net.Conn) {
+	// buffer of 1 to prevent goroutine leak
+	done := make(chan struct{}, 1)
+	cp := func(from, to net.Conn) {
+		_, err := io.Copy(to, from)
+		if err != nil && !strings.Contains(err.Error(), "closed") {
+			log.Println("io.Copy:", err)
+		}
+		done <- struct{}{}
+	}
+	go cp(a, b)
+	go cp(b, a)
+	<-done
+	a.Close()
+	b.Close()
+	log.Println(a.RemoteAddr(), "<->", b.RemoteAddr(), "closed")
+}
